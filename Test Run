@@ -1,0 +1,577 @@
+import os
+import json
+import logging
+import asyncio
+import concurrent.futures
+import sqlite3
+from datetime import datetime
+from urllib.parse import urlparse
+
+import aiohttp
+import requests
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+import spacy
+from transformers import pipeline
+from bs4 import BeautifulSoup
+from sentence_transformers import SentenceTransformer
+import faiss
+import pinecone
+from web3 import Web3
+from googletrans import Translator
+
+from textblob import TextBlob  # For additional sentiment analysis
+import xgboost as xgb  # For ML weight optimization
+
+# Optional: Google Fact Check API
+try:
+    from googleapiclient.discovery import build
+    GOOGLE_FACT_CHECK_ENABLED = True
+except ImportError:
+    GOOGLE_FACT_CHECK_ENABLED = False
+
+# -------------------------
+# Logging Configuration
+# -------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.FileHandler("fact_checking.log"), logging.StreamHandler()]
+)
+
+# -------------------------
+# Configuration
+# -------------------------
+CONFIG = {
+    "google_api_key": "your_google_api_key",
+    "pinecone_api_key": "your_pinecone_api_key",
+    "pinecone_env": "us-west1-gcp",
+    "pinecone_index_name": "fact-checking-index",
+    "blockchain_node_url": "https://your-blockchain-node-url",
+    "blockchain_contract_address": "0xYourContractAddress",
+    "blockchain_contract_abi": "your_contract_ABI"
+}
+
+# -------------------------
+# Database Initialization (SQLite)
+# -------------------------
+DB_PATH = "historical_data.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS credibility_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT,
+            date TEXT,
+            final_score REAL,
+            currency REAL,
+            relevance REAL,
+            authority REAL,
+            accuracy REAL,
+            purpose REAL,
+            sift_score REAL,
+            rag_score REAL,
+            sentiment_polarity REAL,
+            subjectivity REAL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+# Initialize database at startup.
+init_db()
+
+# -------------------------
+# Model & Pipeline Initialization
+# -------------------------
+try:
+    nlp = spacy.load("en_core_web_sm")
+    logging.info("spaCy model loaded successfully.")
+except Exception as e:
+    logging.error(f"Error loading spaCy model: {e}")
+    nlp = None
+
+try:
+    sentiment_pipeline = pipeline("sentiment-analysis")
+    logging.info("Sentiment pipeline initialized successfully.")
+except Exception as e:
+    logging.error(f"Error initializing sentiment pipeline: {e}")
+    sentiment_pipeline = None
+
+try:
+    sim_model = SentenceTransformer('all-MiniLM-L6-v2')
+    logging.info("SentenceTransformer loaded successfully.")
+except Exception as e:
+    logging.error(f"Error loading SentenceTransformer: {e}")
+    sim_model = None
+
+translator = Translator()
+
+# -------------------------
+# FAISS & Pinecone Indexing
+# -------------------------
+def load_real_fact_checking_embeddings():
+    # TODO: Replace with actual pre-trained embeddings for fact-checking.
+    return np.random.rand(10, 384).astype('float32')
+
+fact_embeddings = load_real_fact_checking_embeddings()
+t_index = faiss.IndexFlatL2(384)
+t_index.add(fact_embeddings)
+logging.info("FAISS index populated with sample data.")
+
+USE_PINECONE = False
+pinecone_index = None
+try:
+    pinecone.init(api_key=CONFIG["pinecone_api_key"], environment=CONFIG["pinecone_env"])
+    pinecone_index = pinecone.Index(CONFIG["pinecone_index_name"])
+    USE_PINECONE = True
+    logging.info("Using Pinecone for vector search.")
+except Exception as e:
+    logging.error(f"Pinecone initialization failed, falling back to FAISS: {e}")
+
+# -------------------------
+# Async URL Fetching
+# -------------------------
+async def fetch_url_async(url):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            return await response.text()
+
+# -------------------------
+# Article Extraction & Detailed Metadata Extraction
+# -------------------------
+def extract_article(url):
+    """
+    Extracts article text and detailed metadata from a URL.
+    Attempts to extract publication date and author from common meta tags.
+    """
+    try:
+        response = requests.get(url, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Extract text from <p> tags.
+        paragraphs = soup.find_all('p')
+        text = "\n".join([p.get_text() for p in paragraphs])
+        
+        # Basic metadata.
+        metadata = {
+            "title": soup.title.string.strip() if soup.title and soup.title.string else "No Title",
+            "source_domain": urlparse(url).netloc,
+            "publication_date": None,
+            "author": None
+        }
+        
+        # Attempt to extract publication date from common meta tags.
+        date_meta_names = ["pubdate", "publishdate", "publish_date", "date", "DC.date.issued"]
+        date_meta_props = ["article:published_time"]
+        for tag in soup.find_all("meta"):
+            meta_name = tag.get("name", "").lower()
+            meta_prop = tag.get("property", "").lower()
+            if meta_name in date_meta_names or meta_prop in date_meta_props:
+                content = tag.get("content", "").strip()
+                if content:
+                    try:
+                        # Parse the date string.
+                        parsed_date = datetime.fromisoformat(content)  # May raise ValueError
+                        metadata["publication_date"] = parsed_date.isoformat()
+                        break
+                    except Exception:
+                        try:
+                            # Fallback using dateutil.parser if available.
+                            from dateutil import parser
+                            parsed_date = parser.parse(content)
+                            metadata["publication_date"] = parsed_date.isoformat()
+                            break
+                        except Exception:
+                            continue
+        
+        # Attempt to extract author.
+        author_meta_names = ["author", "article:author"]
+        for tag in soup.find_all("meta"):
+            meta_name = tag.get("name", "").lower()
+            meta_prop = tag.get("property", "").lower()
+            if meta_name in author_meta_names or meta_prop in author_meta_names:
+                content = tag.get("content", "").strip()
+                if content:
+                    metadata["author"] = content
+                    break
+        
+        return text, metadata
+    except Exception as e:
+        logging.error(f"Error extracting article from {url}: {e}")
+        return None, {"error": str(e)}
+
+# -------------------------
+# Fact-Checking Functions (RAG and External APIs)
+# -------------------------
+def fetch_bing_fact_check(query):
+    # TODO: Implement Bing Fact Check API integration.
+    logging.info("Bing Fact Check API not implemented; returning empty list.")
+    return []
+
+def fetch_snopes_fact_check(query):
+    try:
+        search_url = f"https://www.snopes.com/search/{query.replace(' ', '+')}/"
+        response = requests.get(search_url, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        results = soup.find_all('article')
+        return [{"title": article.find('h2').get_text().strip(), "url": article.find('a')['href']} for article in results[:3]]
+    except Exception as e:
+        logging.error(f"Snopes scraping error: {e}")
+        return []
+
+def fetch_politifact_fact_check(query):
+    try:
+        search_url = f"https://www.politifact.com/search/?q={query.replace(' ', '+')}"
+        response = requests.get(search_url, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        results = soup.find_all('article')
+        return [{"title": article.find('h2').get_text().strip(), "url": article.find('a')['href']} for article in results[:3]]
+    except Exception as e:
+        logging.error(f"PolitiFact scraping error: {e}")
+        return []
+
+def google_fact_check_search(query):
+    if not GOOGLE_FACT_CHECK_ENABLED:
+        return fetch_bing_fact_check(query)
+    try:
+        service = build("factchecktools", "v1alpha1", developerKey=CONFIG["google_api_key"])
+        request = service.claims().search(query=query)
+        response = request.execute()
+        results = response.get("claims", [])
+        return [{"text": claim["text"], "rating": claim["claimReview"][0]["textualRating"]} for claim in results]
+    except Exception as e:
+        logging.error(f"Google Fact Check API error: {e}")
+        return fetch_bing_fact_check(query)
+
+def auto_compute_rag_feature(text):
+    """
+    Combines vector search similarity with external fact-check results.
+    """
+    if sim_model is None:
+        logging.error("Similarity model not loaded; cannot compute RAG feature.")
+        return {"rag_score": 0.0}
+
+    query_vector = sim_model.encode(text).tolist()
+
+    if USE_PINECONE and pinecone_index is not None:
+        try:
+            results = pinecone_index.query(query_vector, top_k=3, include_metadata=True)
+            matches = results.get("matches", [])
+        except Exception as e:
+            logging.error(f"Pinecone query error: {e}")
+            matches = []
+    else:
+        query_np = np.array([query_vector]).astype('float32')
+        distances, _ = t_index.search(query_np, 3)
+        matches = [{"score": 1 / (d + 1e-5)} for d in distances[0]] if distances.size > 0 else []
+
+    avg_score = sum(match['score'] for match in matches) / len(matches) if matches else 0.0
+
+    # Fetch external fact-check data concurrently.
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future_google = executor.submit(google_fact_check_search, text)
+        future_snopes = executor.submit(fetch_snopes_fact_check, text)
+        future_politifact = executor.submit(fetch_politifact_fact_check, text)
+
+        google_results = future_google.result()
+        snopes_results = future_snopes.result()
+        politifact_results = future_politifact.result()
+
+    credibility_boost = 0.15 * len(google_results) if google_results else 0.0
+    external_boost = 0.1 * (len(snopes_results) + len(politifact_results))
+    rag_score = round(avg_score + credibility_boost + external_boost, 2)
+
+    return {"rag_score": rag_score}
+
+# -------------------------
+# Sentiment & Bias Analysis
+# -------------------------
+def analyze_sentiment_and_bias(text):
+    """
+    Analyze sentiment and detect potential bias using multiple approaches.
+    Returns a dict with sentiment scores and bias indicators.
+    """
+    # Use the Transformers sentiment pipeline (process only the first 512 characters).
+    sentiment_result = {}
+    if sentiment_pipeline:
+        try:
+            sentiment_result = sentiment_pipeline(text[:512])
+        except Exception as e:
+            logging.error(f"Error during sentiment analysis (pipeline): {e}")
+
+    # Use TextBlob for additional sentiment metrics.
+    try:
+        blob = TextBlob(text)
+        polarity = blob.sentiment.polarity  # Range: -1 (negative) to 1 (positive)
+        subjectivity = blob.sentiment.subjectivity  # Range: 0 (objective) to 1 (subjective)
+    except Exception as e:
+        logging.error(f"Error during sentiment analysis (TextBlob): {e}")
+        polarity, subjectivity = 0.0, 0.0
+
+    # A simple bias detection heuristic: high subjectivity may indicate bias.
+    bias_score = subjectivity
+    # Additionally, check for presence of common bias words.
+    bias_keywords = {"obviously", "clearly", "undeniably", "shockingly", "allegedly"}
+    words = set(text.lower().split())
+    bias_keyword_hits = len(bias_keywords.intersection(words))
+    if bias_keyword_hits > 0:
+        bias_score = min(1.0, bias_score + 0.2)  # Boost bias score if bias words are present
+
+    return {
+        "sentiment": sentiment_result,
+        "polarity": polarity,
+        "subjectivity": subjectivity,
+        "bias_score": bias_score  # 0 (least biased) to 1 (highly biased)
+    }
+
+# -------------------------
+# Credibility Scoring (CRAAP & SIFT Frameworks)
+# -------------------------
+def auto_compute_craap_features(text, metadata):
+    """
+    Compute CRAAP scores based on:
+      - Currency, Relevance, Authority, Accuracy, Purpose.
+    For demonstration, these are computed using simple heuristics.
+    """
+    # Example heuristics: newer articles get a higher currency score.
+    now = datetime.utcnow()
+    try:
+        pub_date = datetime.fromisoformat(metadata.get("publication_date")) if metadata.get("publication_date") else now
+    except Exception:
+        pub_date = now
+    delta_days = (now - pub_date).days
+    currency = max(0.0, 1 - delta_days / 365)  # Decay over a year.
+
+    # Other factors are set to dummy values or computed from the source domain.
+    relevance = 0.9  # Assume high relevance.
+    authority = 0.8 if metadata.get("source_domain", "").endswith((".gov", ".edu")) else 0.6
+    accuracy = 0.85  # Dummy value.
+    purpose = 0.75  # Dummy value.
+
+    return {
+        "currency": round(currency, 2),
+        "relevance": relevance,
+        "authority": authority,
+        "accuracy": accuracy,
+        "purpose": purpose
+    }
+
+def auto_compute_sift_feature(metadata, craap_features):
+    """
+    Compute SIFT score based on source credibility, corroboration, and reference integrity.
+    Here, we simply take the average of CRAAP factors as a proxy.
+    """
+    average_craap = sum(craap_features.values()) / len(craap_features)
+    return {"sift_score": round(average_craap, 2)}
+
+def compute_final_score(craap_features, sift_features, rag_features, metadata, text):
+    """
+    Combine all scores into a final credibility score.
+    Initially uses default weights, but these may be updated via ML optimization.
+    """
+    final_score = (0.4 * (sum(craap_features.values()) / len(craap_features)) +
+                   0.3 * sift_features.get("sift_score", 0) +
+                   0.3 * rag_features.get("rag_score", 0))
+    return {"final_score": round(final_score, 2)}
+
+def map_score_to_label(score):
+    """
+    Convert a numerical score (-100 to 100) to a user-friendly label.
+    """
+    if score >= 90:
+        return "Highly Reliable ✅"
+    elif score >= 80:
+        return "Reliable 👍"
+    elif score >= 60:
+        return "Somewhat Reliable 🧐"
+    elif score >= 30:
+        return "Questionable ⚠️"
+    elif score >= 0:
+        return "Unreliable ❌"
+    elif score >= -50:
+        return "Misinformation 🚨"
+    else:
+        return "Disinformation 🛑"
+
+# -------------------------
+# Self-Learning Weight Optimization (ML)
+# -------------------------
+def optimize_weights_with_ml():
+    """
+    Connects to the historical database, trains an XGBoost regressor to predict the final score
+    from the three aggregated features (CRAAP average, SIFT score, RAG score), and returns the
+    normalized feature importances as optimized weights.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query("SELECT currency, relevance, authority, accuracy, purpose, sift_score, rag_score, final_score FROM credibility_history", conn)
+    conn.close()
+    
+    if df.empty or len(df) < 10:
+        logging.info("Not enough historical data for ML optimization; using default weights.")
+        return {"craap_weight": 0.4, "sift_weight": 0.3, "rag_weight": 0.3}
+    
+    # Compute CRAAP average.
+    df["craap_avg"] = df[["currency", "relevance", "authority", "accuracy", "purpose"]].mean(axis=1)
+    features = df[["craap_avg", "sift_score", "rag_score"]]
+    target = df["final_score"]
+    
+    dtrain = xgb.DMatrix(features, label=target)
+    params = {
+        "objective": "reg:squarederror",
+        "max_depth": 3,
+        "eta": 0.1,
+        "seed": 42
+    }
+    model = xgb.train(params, dtrain, num_boost_round=50)
+    
+    # Get feature importances.
+    booster = model.get_booster()
+    importance = booster.get_score(importance_type="weight")
+    
+    # Ensure all three features are present.
+    for feat in ["craap_avg", "sift_score", "rag_score"]:
+        if feat not in importance:
+            importance[feat] = 1
+    
+    # Normalize weights to sum to 1.
+    total = sum(importance.values())
+    optimized_weights = {
+        "craap_weight": importance["craap_avg"] / total,
+        "sift_weight": importance["sift_score"] / total,
+        "rag_weight": importance["rag_score"] / total
+    }
+    logging.info(f"Optimized weights: {optimized_weights}")
+    return optimized_weights
+
+# -------------------------
+# Blockchain-Based Verification
+# -------------------------
+def verify_on_blockchain(url):
+    try:
+        w3 = Web3(Web3.HTTPProvider(CONFIG["blockchain_node_url"]))
+        contract_address = CONFIG["blockchain_contract_address"]
+        contract_abi = json.loads(CONFIG["blockchain_contract_abi"])
+        contract = w3.eth.contract(address=contract_address, abi=contract_abi)
+        return contract.functions.verifyContent(url).call()
+    except Exception as e:
+        logging.error(f"Blockchain verification error for {url}: {e}")
+        return False
+
+# -------------------------
+# Historical Tracking & Analysis
+# -------------------------
+def log_source_history(metadata, final_score, craap_features, sift_features, rag_features, sentiment_analysis):
+    """
+    Logs historical credibility data to the SQLite database.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO credibility_history (
+            source, date, final_score, currency, relevance, authority, accuracy, purpose, sift_score, rag_score, sentiment_polarity, subjectivity
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        metadata.get("source_domain", "unknown"),
+        datetime.utcnow().isoformat(),
+        final_score,
+        craap_features.get("currency", 0),
+        craap_features.get("relevance", 0),
+        craap_features.get("authority", 0),
+        craap_features.get("accuracy", 0),
+        craap_features.get("purpose", 0),
+        sift_features.get("sift_score", 0),
+        rag_features.get("rag_score", 0),
+        sentiment_analysis.get("polarity", 0),
+        sentiment_analysis.get("subjectivity", 0)
+    ))
+    conn.commit()
+    conn.close()
+    logging.info("Historical record logged.")
+
+def analyze_historical_trends():
+    """
+    Reads historical data from the database and plots the average final score over time.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query("SELECT date, final_score FROM credibility_history", conn)
+    conn.close()
+    
+    if df.empty:
+        logging.info("No historical data to analyze.")
+        return
+    
+    # Convert date strings to datetime objects.
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values("date")
+    # Group by day and compute average final score.
+    df_grouped = df.groupby(df['date'].dt.date)['final_score'].mean().reset_index()
+    
+    plt.figure(figsize=(10, 5))
+    plt.plot(df_grouped['date'], df_grouped['final_score'], marker='o')
+    plt.title("Average Final Credibility Score Over Time")
+    plt.xlabel("Date")
+    plt.ylabel("Average Final Score")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+# -------------------------
+# Main Assessment Function
+# -------------------------
+def assess_content(url):
+    """
+    Extracts the article, computes all feature scores, logs history, and returns a final credibility assessment.
+    """
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future_extraction = executor.submit(extract_article, url)
+        text, metadata = future_extraction.result()
+        if text is None:
+            return {"error": "Article extraction failed", "details": metadata.get("error")}
+
+        future_craap = executor.submit(auto_compute_craap_features, text, metadata)
+        future_rag = executor.submit(auto_compute_rag_feature, text)
+        future_sentiment = executor.submit(analyze_sentiment_and_bias, text)
+        
+        craap_features = future_craap.result()
+        rag_features = future_rag.result()
+        sentiment_analysis = future_sentiment.result()
+        
+        # Compute SIFT based on metadata and CRAAP features.
+        sift_features = auto_compute_sift_feature(metadata, craap_features)
+
+    final_result = compute_final_score(craap_features, sift_features, rag_features, metadata, text)
+    final_score = final_result.get("final_score", 0)
+    final_result["label"] = map_score_to_label(final_score)
+    
+    # Optionally verify via blockchain.
+    blockchain_verified = verify_on_blockchain(url)
+    final_result["blockchain_verification"] = "✅ Verified" if blockchain_verified else "❌ Not Found"
+    
+    # Log historical tracking.
+    log_source_history(metadata, final_score, craap_features, sift_features, rag_features, sentiment_analysis)
+    
+    # Optionally, attach sentiment and bias analysis results.
+    final_result["sentiment_bias"] = sentiment_analysis
+
+    return final_result
+
+# -------------------------
+# Example Usage
+# -------------------------
+if __name__ == "__main__":
+    test_url = "https://www.nytimes.com/2016/02/12/science/ligo-gravitational-waves-black-holes-einstein.html"
+    result = assess_content(test_url)
+    logging.info(f"Assessment result: {result}")
+    print(result)
+    
+    # Optionally, optimize weights based on historical data.
+    weights = optimize_weights_with_ml()
+    print("Optimized Weights:", weights)
+    
+    # Optionally, analyze historical trends.
+    analyze_historical_trends()
