@@ -1,0 +1,16 @@
+requests
+beautifulsoup4
+spacy
+transformers
+sentence_transformers
+faiss-cpu
+pinecone-client
+web3
+googletrans==4.0.0-rc1
+textblob
+xgboost
+matplotlib
+aiohttp
+python-dateutil
+pandas
+numpy
